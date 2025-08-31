@@ -1,12 +1,33 @@
-fastapi
-uvicorn
-python-telegram-bot
-together
-langchain-community
-langchain-text-splitters
-rank-bm25
-nltk
-faiss-cpu
-numpy
-python-dotenv
-sentence-transformers
+# Core web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Telegram bot
+python-telegram-bot>=20.0
+
+# AI provider
+groq>=0.4.0
+
+# Document processing and RAG
+langchain-community>=0.0.20
+langchain-text-splitters>=0.0.1
+sentence-transformers>=2.2.0
+PyPDF2>=3.0.0
+
+# Vector search and embeddings
+faiss-cpu>=1.7.4
+# Use faiss-gpu instead of faiss-cpu if GPU is available
+
+# Keyword search
+rank-bm25>=0.2.2
+
+# Natural language processing
+nltk>=3.8
+
+# Utilities
+numpy>=1.24.0
+python-dotenv>=1.0.0
+
+# Background task management (already included with fastapi/uvicorn)
+# asyncio is built into Python 3.7+
