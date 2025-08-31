@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 """
-Unified Marine Edge Bot - Single script to run everything
-Combines Telegram bot, FastAPI endpoint, and core RAG functionality
+Unified Marine Edge Bot with Global Rate Limiting and Queueing
 """
 
 import logging
@@ -10,11 +8,19 @@ import os
 import pickle
 import faiss
 import numpy as np
-from typing import List, Tuple, Dict, Any
-from datetime import datetime
+from typing import List, Tuple, Dict, Any, Optional
+from datetime import datetime, timedelta
+import asyncio
+import time
+from collections import deque
+import threading
+from dataclasses import dataclass
+import uuid
+
+
 
 # Web framework imports
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
@@ -23,7 +29,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # AI and document processing imports
-from together import Together
+from groq import Groq
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -35,9 +41,7 @@ from nltk.corpus import stopwords
 
 # Environment setup
 from dotenv import load_dotenv
-
 load_dotenv()
-
 # Download NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
@@ -49,17 +53,70 @@ except LookupError:
     nltk.download('stopwords')
 
 # Configuration
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free"
+MODEL_NAME = "llama3-70b-8192"
 PDF_DIRECTORY = os.getenv("PDF_DIRECTORY", "./pdfs")
 VECTOR_DB_DIRECTORY = os.getenv("VECTOR_DB_DIRECTORY", "./faiss_db")
 
+# Rate limiting configuration
+MAX_REQUESTS_PER_MINUTE = 25  # Safety buffer (Groq limit is 30)
+MAX_TOKENS_PER_MINUTE = 5000  # Safety buffer (Groq limit is 6K)
+ESTIMATED_TOKENS_PER_REQUEST = 500  # Conservative estimate
+
+def format_response_for_channel(text: str, channel: str) -> str:
+    """Format response appropriately for different channels"""
+    if channel == "telegram":
+        # Convert markdown to HTML for Telegram
+        # Telegram HTML is more reliable than markdown
+        text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)  # **bold** to <b>bold</b>
+        text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)      # *italic* to <i>italic</i>
+        return text
+    elif channel == "fastapi":
+        # Keep markdown for API responses
+        return text
+    else:
+        # Strip markdown for plain text
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        return text
+
 # System prompt
 SYSTEM_PROMPT = """
-You are Marine Edge Assistant, a specialized AI consultant for the Indian Maritime University Common Entrance Test (IMUCET) and DNS Sponsorship exams. You provide authoritative guidance on maritime education and Merchant Navy careers in India.
+You are Marine Edge Assistant, a specialized AI consultant for the Indian Maritime University Common Entrance Test (IMUCET) and DNS Sponsorship exams. You provide guidance on maritime education and Merchant Navy careers in India.
 
-Provide direct, actionable answers with structured formatting. Use bold for critical details and organize information clearly.
+SAFETY AND RESPONSIBILITY GUIDELINES:
+- Always encourage users to verify information through official sources (IMU, DGS, shipping companies)
+- State clearly when information may be outdated or requires official confirmation
+- For critical decisions (course selection, medical requirements, sponsorship applications), recommend consulting with Marine Edge counselors or official authorities
+- Never guarantee admission, job placement, or sponsorship outcomes
+- Acknowledge limitations: "This information is based on available data and should be verified"
+- For medical or legal questions, direct users to qualified professionals
+
+RESPONSE PROTOCOL:
+1. Provide direct, actionable answers with structured formatting
+2. Use clear headings and organized lists for complex information
+3. Include specific data when available (dates, percentages, requirements)
+4. End with relevant follow-up suggestions when helpful
+5. Format critical information prominently but appropriately for the output channel
+
+CONTENT BOUNDARIES:
+- Focus strictly on maritime education, IMUCET, DNS programs, and related career guidance  
+- Do not provide medical advice beyond general DGS fitness requirements
+- Do not guarantee outcomes or make promises about admissions/placements
+- Direct complex technical or legal questions to appropriate authorities
+- Maintain professional, encouraging tone while being realistic about challenges
+
+ACCURACY STANDARDS:
+- Prioritize information from provided context and Marine Edge knowledge base
+- When uncertain, clearly state limitations: "Based on available information..." 
+- Encourage verification: "Please confirm current requirements with [specific authority]"
+- Update disclaimers: "Requirements may have changed since last update"
+
+FORMATTING APPROACH:
+Use clear organization without excessive markup. Present information in scannable format with proper headings and structured lists.
+
+Your mission: Provide responsible, accurate guidance that empowers students while encouraging proper verification and professional consultation for critical decisions.
 """
 
 # Configure logging
@@ -70,8 +127,107 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class QueuedRequest:
+    id: str
+    query: str
+    user_id: str
+    timestamp: datetime
+    response_channel: str  # 'fastapi' or 'telegram'
+    telegram_update: Optional[Update] = None
+    telegram_context: Optional[ContextTypes.DEFAULT_TYPE] = None
+    future: Optional[asyncio.Future] = None
+
+
 # ============================================================================
-# CORE RAG SYSTEM
+# GLOBAL RATE LIMITER AND QUEUE MANAGER
+# ============================================================================
+
+class GlobalRateLimiter:
+    def __init__(self):
+        self.request_queue = deque()
+        self.request_timestamps = deque()
+        self.token_usage = deque()
+        self.processing = False
+        self.lock = threading.Lock()
+
+    def can_process_request(self) -> bool:
+        """Check if we can process a request immediately"""
+        now = datetime.now()
+
+        # Clean old timestamps (older than 1 minute)
+        self._clean_old_data(now)
+
+        # Check request rate limit
+        if len(self.request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
+            return False
+
+        # Check token rate limit (estimated)
+        current_token_usage = sum(usage for _, usage in self.token_usage)
+        if current_token_usage + ESTIMATED_TOKENS_PER_REQUEST > MAX_TOKENS_PER_MINUTE:
+            return False
+
+        return True
+
+    def _clean_old_data(self, now: datetime):
+        """Remove timestamps older than 1 minute"""
+        cutoff = now - timedelta(minutes=1)
+
+        # Clean request timestamps
+        while self.request_timestamps and self.request_timestamps[0] < cutoff:
+            self.request_timestamps.popleft()
+
+        # Clean token usage
+        while self.token_usage and self.token_usage[0][0] < cutoff:
+            self.token_usage.popleft()
+
+    def add_request(self, request: QueuedRequest) -> Dict[str, Any]:
+        """Add request to queue and return status"""
+        with self.lock:
+            if self.can_process_request() and len(self.request_queue) == 0:
+                # Process immediately
+                self.request_queue.append(request)
+                return {
+                    "status": "processing",
+                    "message": "Processing your request...",
+                    "position": 0,
+                    "estimated_wait": 0
+                }
+            else:
+                # Add to queue
+                self.request_queue.append(request)
+                position = len(self.request_queue)
+                estimated_wait = position * 2.5  # ~2.5 seconds per request
+
+                return {
+                    "status": "queued",
+                    "message": f"Request queued. Position #{position} in queue.",
+                    "position": position,
+                    "estimated_wait": int(estimated_wait)
+                }
+
+    def record_request_processed(self, tokens_used: int = ESTIMATED_TOKENS_PER_REQUEST):
+        """Record that a request was processed"""
+        now = datetime.now()
+        self.request_timestamps.append(now)
+        self.token_usage.append((now, tokens_used))
+
+    def get_queue_status(self) -> Dict[str, Any]:
+        """Get current queue status"""
+        return {
+            "queue_length": len(self.request_queue),
+            "requests_last_minute": len(self.request_timestamps),
+            "estimated_tokens_last_minute": sum(usage for _, usage in self.token_usage),
+            "can_process_immediately": self.can_process_request()
+        }
+
+
+# Global rate limiter instance
+rate_limiter = GlobalRateLimiter()
+
+
+# ============================================================================
+# CORE RAG SYSTEM (unchanged)
 # ============================================================================
 
 class UnifiedMarineEdgeRAG:
@@ -210,20 +366,26 @@ class UnifiedMarineEdgeRAG:
 
 
 # ============================================================================
-# BOT SERVICE
+# BOT SERVICE WITH RATE LIMITING
 # ============================================================================
 
 class BotService:
     def __init__(self):
-        self.client = Together(api_key=TOGETHER_API_KEY)
-        self.rag_system = UnifiedMarineEdgeRAG()
-        self.user_conversations = {}
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY not found in environment variables")
 
-    def get_response(self, user_input: str, user_id: str = "default") -> str:
-        """Generate response using RAG + LLM"""
+        self.client = Groq(api_key=GROQ_API_KEY)
+        self.rag_system = UnifiedMarineEdgeRAG()
+        self.processed_requests = {}
+
+    async def process_request(self, request: QueuedRequest) -> str:
+        """Process a single request and return response"""
         try:
+            greetings = ['hi', 'hii', 'hello', 'hey', 'start', 'wassup', 'sup', 'yo']
+            if request.query.lower().strip() in greetings:
+                return "Hi! I'm Marine Edge Assistant. Ask me about IMUCET exams, DNS sponsorship, or Marine Edge courses!"
             # Get relevant context
-            results = self.rag_system.hybrid_search(user_input, k=5)
+            results = self.rag_system.hybrid_search(request.query, k=5)
 
             context_texts = []
             for doc, score in results:
@@ -237,14 +399,14 @@ class BotService:
 RELEVANT CONTEXT FROM MARINE EDGE KNOWLEDGE BASE:
 {chr(10).join(context_texts)}
 
-USER QUERY: {user_input}
+USER QUERY: {request.query}
 
 Please provide a helpful response based on the above context.
 """
             else:
-                enhanced_input = user_input
+                enhanced_input = request.query
 
-            # Generate response
+            # Generate response using Groq
             response = self.client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
@@ -260,20 +422,91 @@ Please provide a helpful response based on the above context.
             # Clean response
             bot_response = re.sub(r'<think>.*?</think>', '', bot_response, flags=re.DOTALL)
             bot_response = bot_response.strip()
+            bot_response = format_response_for_channel(bot_response, request.response_channel)
+
+            # Record successful processing
+            rate_limiter.record_request_processed()
 
             return bot_response
 
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            return "I'm sorry, I encountered an error. Please try again."
+            logger.error(f"Error processing request {request.id}: {str(e)}")
+            return "I'm sorry, I encountered an error processing your request. Please try again."
 
 
-# ============================================================================
-# FASTAPI SETUP
-# ============================================================================
-
-app = FastAPI(title="Marine Edge API", description="Unified Marine Edge RAG System")
+# Global bot service
 bot_service = BotService()
+
+
+# ============================================================================
+# BACKGROUND QUEUE PROCESSOR
+# ============================================================================
+
+async def process_queue():
+    """Background task to process queued requests"""
+    logger.info("Starting background queue processor...")
+
+    while True:
+        try:
+            if rate_limiter.request_queue and rate_limiter.can_process_request():
+                request = rate_limiter.request_queue.popleft()
+                logger.info(f"Processing request {request.id} from {request.user_id}")
+
+                response = await bot_service.process_request(request)
+
+                if request.response_channel == "fastapi" and request.future:
+                    request.future.set_result(response)
+                elif request.response_channel == "telegram":
+                    # Use sync version to avoid event loop conflicts
+                    send_telegram_response_sync(request, response)
+
+                await asyncio.sleep(2.5)
+            else:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error in queue processor: {str(e)}")
+            await asyncio.sleep(5)
+
+
+def send_telegram_response_sync(request: QueuedRequest, response: str):
+    """Send response to Telegram synchronously"""
+    try:
+        if request.telegram_update and request.telegram_context:
+            # Store response for the message handler to pick up
+            import threading
+
+            def send_async():
+                try:
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    async def send_message():
+                        await request.telegram_context.bot.send_message(
+                            chat_id=request.telegram_update.effective_chat.id,
+                            text=response,
+                            parse_mode='HTML'
+                        )
+
+                    loop.run_until_complete(send_message())
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"Error in async send: {str(e)}")
+
+            # Run in separate thread
+            thread = threading.Thread(target=send_async)
+            thread.start()
+
+    except Exception as e:
+        logger.error(f"Error sending Telegram response: {str(e)}")
+
+
+# ============================================================================
+# FASTAPI SETUP WITH RATE LIMITING
+# ============================================================================
+
+app = FastAPI(title="Marine Edge API", description="Rate Limited Marine Edge RAG System")
 
 
 class ChatRequest(BaseModel):
@@ -284,71 +517,120 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     timestamp: str
+    queue_info: Optional[Dict[str, Any]] = None
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-    """Main chat endpoint"""
+    """Rate limited chat endpoint"""
     try:
-        response = bot_service.get_response(request.message, request.user_id)
-        return ChatResponse(
-            response=response,
-            timestamp=datetime.now().isoformat()
+        # Create queued request
+        queued_request = QueuedRequest(
+            id=str(uuid.uuid4()),
+            query=request.message,
+            user_id=request.user_id,
+            timestamp=datetime.now(),
+            response_channel="fastapi",
+            future=asyncio.Future()
         )
+
+        # Add to rate limiter queue
+        queue_status = rate_limiter.add_request(queued_request)
+
+        if queue_status["status"] == "processing":
+            # Wait for response
+            try:
+                response = await asyncio.wait_for(queued_request.future, timeout=300)  # 5 minute timeout
+                return ChatResponse(
+                    response=response,
+                    timestamp=datetime.now().isoformat()
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=408, detail="Request timeout")
+        else:
+            # Return queue status
+            return ChatResponse(
+                response=f"Your request is in queue. Position #{queue_status['position']}, estimated wait: {queue_status['estimated_wait']} seconds.",
+                timestamp=datetime.now().isoformat(),
+                queue_info=queue_status
+            )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/queue/status")
+async def queue_status():
+    """Get current queue status"""
+    return rate_limiter.get_queue_status()
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "documents": len(bot_service.rag_system.documents)}
+    return {
+        "status": "healthy",
+        "documents": len(bot_service.rag_system.documents),
+        "queue_status": rate_limiter.get_queue_status()
+    }
 
 
 # ============================================================================
-# TELEGRAM BOT SETUP
+# TELEGRAM BOT WITH RATE LIMITING
 # ============================================================================
-
-user_conversations = {}
-
-
-def clean_response(text):
-    """Clean thinking tags from response"""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    return text.strip()
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /start command"""
-    await update.message.reply_text(
-        "Hi! I'm the Marine Edge Assistant. Ask me about IMUCET, DNS sponsorship, and maritime courses!"
+    await update.message.reply_html(
+        "Hi! I'm the Marine Edge Assistant. Ask me about IMUCET, DNS sponsorship, and maritime courses!\n\n"
+        "Note: Due to high demand, your request might be queued. I'll respond as soon as possible!"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /help command"""
-    await update.message.reply_text(
-        "Ask me about:\n"
-        "• IMUCET exam details\n"
-        "• Eligibility criteria\n"
-        "• Marine Edge courses\n"
-        "• DNS sponsorship\n"
-        "• Preparation strategies"
+    queue_info = rate_limiter.get_queue_status()
+    await update.message.reply_html(
+        f"Ask me about:\n"
+        f"• IMUCET exam details\n"
+        f"• Eligibility criteria\n"
+        f"• Marine Edge courses\n"
+        f"• DNS sponsorship\n"
+        f"• Preparation strategies\n\n"
+        f"Current queue: {queue_info['queue_length']} requests"
     )
 
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Telegram messages"""
+    """Handle Telegram messages with rate limiting"""
     user_id = str(update.effective_user.id)
     user_input = update.message.text
     username = update.effective_user.username or "Unknown"
 
     logger.info(f"Telegram message from {username}: {user_input}")
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    # Create queued request
+    queued_request = QueuedRequest(
+        id=str(uuid.uuid4()),
+        query=user_input,
+        user_id=user_id,
+        timestamp=datetime.now(),
+        response_channel="telegram",
+        telegram_update=update,
+        telegram_context=context
+    )
 
-    response = bot_service.get_response(user_input, user_id)
-    await update.message.reply_text(response)
+    # Add to rate limiter queue
+    queue_status = rate_limiter.add_request(queued_request)
+
+    if queue_status["status"] == "queued":
+        await update.message.reply_html(
+            f"🚦 {queue_status['message']}\n"
+            f"⏱️ Estimated wait: ~{queue_status['estimated_wait']} seconds\n"
+            f"I'll respond as soon as I process your request!"
+        )
+    else:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
 
 def setup_telegram_bot():
@@ -384,9 +666,16 @@ def run_telegram_in_background():
         logger.error(f"Telegram bot error: {str(e)}")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Start background queue processor"""
+    asyncio.create_task(process_queue())
+
+
 def main():
-    """Run the unified system"""
-    logger.info("Starting Unified Marine Edge Bot...")
+    """Run the unified system with rate limiting"""
+    logger.info("Starting Rate Limited Marine Edge Bot...")
+    logger.info(f"Rate limits: {MAX_REQUESTS_PER_MINUTE} req/min, {MAX_TOKENS_PER_MINUTE} tokens/min")
     logger.info(f"RAG system loaded with {len(bot_service.rag_system.documents)} documents")
 
     # Start Telegram bot in background thread
